@@ -1,85 +1,114 @@
 const fs = require('fs');
 const path = require('path');
-const { readdir, stat, writeFile } = require('fs/promises');
+const { readdir, writeFile } = require('fs/promises');
 
 // ================= 配置 =================
 const ROOT = __dirname;
-const IGNORE_DIRS = new Set(['_附件', 'node_modules', '.git', '.vuepress', 'docs', 'data']);
-const IGNORE_FILES = new Set(['filetree.json', '.DS_Store']);
+const IGNORE_DIRS = new Set(['.git', 'node_modules', '.vuepress', 'docs', 'data']);
+const IGNORE_FILES = new Set(['filetree.json', '.DS_Store', 'desktop.ini', 'README.md']);
 
-// ================= 工具函数 =================
+const toUnixPath = (p) => p.split(path.sep).join('/');
+const getRepoPath = (fullPath) => toUnixPath(path.relative(ROOT, fullPath));
 
-function toUnixPath(p) {
-    return p.split(path.sep).join('/');
-}
+// ================= 判断逻辑 =================
 
-function getRepoRelativePath(fullPath) {
-    const rel = path.relative(ROOT, fullPath);
-    return toUnixPath(rel);
-}
+async function shouldGenerateTree(dirPath, entries) {
+    const folderName = path.basename(dirPath);
 
-// ================= 判断是否是课程 =================
-function isCourseFolder(dir, entries) {
+    // 1. 绝对排除：自己就是 "_附件" 或者是根目录，或者在忽略名单中
+    if (folderName === '_附件' || IGNORE_DIRS.has(folderName) || dirPath === ROOT) {
+        return false;
+    }
+
+    // 2. 必要条件：必须有 README.md
     const hasReadme = entries.some(e => e.isFile() && e.name.toLowerCase() === 'readme.md');
-    const folderName = path.basename(dir);
-    return hasReadme && folderName !== '_附件';
+    if (!hasReadme) return false;
+
+    // 3. 区分“课程”与“分类目录”：
+    // 我们认为一个文件夹是“课程资源包”，只要它满足以下任一条件：
+    const isCourse = entries.some(e => {
+        // 条件 A: 含有名为 "_附件" 的子目录
+        if (e.isDirectory() && e.name === '_附件') return true;
+
+        // 条件 B: 含有真正的资源文件（排除掉 readme, json 和隐藏文件）
+        if (e.isFile()) {
+            const name = e.name.toLowerCase();
+            const ext = path.extname(name);
+            if (name !== 'readme.md' && ext !== '.json' && !name.startsWith('.')) {
+                return true;
+            }
+        }
+        return false;
+    });
+
+    return isCourse;
 }
 
-// ================= 递归生成文件树 =================
-async function scanDirectory(currentDir) {
+// ================= 递归构建文件树 =================
+
+async function buildTreeData(currentDir) {
     const entries = await readdir(currentDir, { withFileTypes: true });
     const tree = [];
 
     for (const entry of entries) {
-        if (IGNORE_DIRS.has(entry.name) || IGNORE_FILES.has(entry.name)) continue;
+        // 剔除不需要展示在下载树里的文件
+        if (IGNORE_FILES.has(entry.name)) continue;
+        if (entry.isFile() && entry.name.toLowerCase() === 'readme.md') continue;
+        if (entry.isDirectory() && IGNORE_DIRS.has(entry.name)) continue;
 
         const fullPath = path.join(currentDir, entry.name);
-        const repoRelPath = getRepoRelativePath(fullPath);
+        const repoPath = getRepoPath(fullPath);
 
         if (entry.isDirectory()) {
-            const children = await scanDirectory(fullPath);
-            if (children.length > 0) {
-                tree.push({
-                    name: entry.name,
-                    type: 'directory',
-                    path: repoRelPath,
-                    children: children,
-                });
-            }
+            const children = await buildTreeData(fullPath);
+            // 记录文件夹及其子内容
+            tree.push({
+                name: entry.name,
+                type: 'directory',
+                path: repoPath,
+                children: children
+            });
         } else {
             tree.push({
                 name: entry.name,
                 type: 'file',
-                path: repoRelPath,
-                ext: path.extname(entry.name),
+                path: repoPath,
+                ext: path.extname(entry.name)
             });
         }
     }
     return tree.sort((a, b) => (b.type === 'directory') - (a.type === 'directory'));
 }
 
-// ================= 递归扫描所有课程 =================
-async function scanAll(currentDir) {
+// ================= 遍历扫描 =================
+
+async function scan(currentDir) {
     const entries = await readdir(currentDir, { withFileTypes: true });
 
-    // 1. 检查当前文件夹是否是课程
-    if (isCourseFolder(currentDir, entries)) {
-        const tree = await scanDirectory(currentDir);
-        const outputPath = path.join(currentDir, 'filetree.json');
-        await writeFile(outputPath, JSON.stringify(tree, null, 2), 'utf8');
-        console.log('✅ 已生成:', getRepoRelativePath(currentDir));
+    // 判定当前目录是否需要生成 filetree.json
+    if (await shouldGenerateTree(currentDir, entries)) {
+        console.log(`📦 识别到资源包: /${path.relative(ROOT, currentDir)}`);
+        const tree = await buildTreeData(currentDir);
+
+        if (tree.length > 0) {
+            await writeFile(
+                path.join(currentDir, 'filetree.json'),
+                JSON.stringify(tree, null, 2),
+                'utf8'
+            );
+        }
     }
 
-    // 2. 递归子文件夹
+    // 继续向下递归
     for (const entry of entries) {
         if (entry.isDirectory() && !IGNORE_DIRS.has(entry.name)) {
-            await scanAll(path.join(currentDir, entry.name));
+            await scan(path.join(currentDir, entry.name));
         }
     }
 }
 
-// ================= 启动 =================
-console.log('🚀 正在构建 GitHub 下载路径兼容的文件树...');
-scanAll(ROOT).then(() => {
-    console.log('\n✨ 所有 filetree.json 生成完毕！');
-});
+// ================= 执行 =================
+console.log('🚀 启动智能识别脚本...');
+scan(ROOT).then(() => {
+    console.log('\n✅ 执行完成。');
+}).catch(err => console.error(err));
